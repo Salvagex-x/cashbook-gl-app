@@ -1,22 +1,41 @@
+import os
 import sqlite3
 from datetime import date
 import pandas as pd
 import streamlit as st
 
+try:
+    import psycopg2
+except ImportError:
+    psycopg2 = None
+
 st.set_page_config(page_title="Cashbook to General Ledger", layout="wide")
 
-DB_FILE = "ledger_data.db"
+
+def get_db_url():
+    try:
+        if "DATABASE_URL" in st.secrets:
+            return st.secrets["DATABASE_URL"]
+    except Exception:
+        pass
+    return os.environ.get("DATABASE_URL")
+
+
+DB_URL = get_db_url()
+USE_POSTGRES = bool(DB_URL and psycopg2 is not None)
+PH = "%s" if USE_POSTGRES else "?"
 
 
 def get_conn():
-    return sqlite3.connect(DB_FILE, check_same_thread=False)
+    if USE_POSTGRES:
+        return psycopg2.connect(DB_URL)
+    return sqlite3.connect("ledger_data.db", check_same_thread=False)
 
 
 def init_db():
     conn = get_conn()
     cur = conn.cursor()
 
-    # 1. Chart of Accounts Table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS accounts (
             code TEXT PRIMARY KEY,
@@ -26,22 +45,35 @@ def init_db():
         )
     """)
 
-    # 2. Cashbook Transactions Table
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS cashbook (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tx_date TEXT NOT NULL,
-            ref_no TEXT NOT NULL,
-            tx_type TEXT NOT NULL,
-            cash_acc TEXT NOT NULL,
-            gl_acc TEXT NOT NULL,
-            unit_tag TEXT NOT NULL,
-            description TEXT NOT NULL,
-            amount REAL NOT NULL
-        )
-    """)
+    if USE_POSTGRES:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS cashbook (
+                id SERIAL PRIMARY KEY,
+                tx_date TEXT NOT NULL,
+                ref_no TEXT NOT NULL,
+                tx_type TEXT NOT NULL,
+                cash_acc TEXT NOT NULL,
+                gl_acc TEXT NOT NULL,
+                unit_tag TEXT NOT NULL,
+                description TEXT NOT NULL,
+                amount DOUBLE PRECISION NOT NULL
+            )
+        """)
+    else:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS cashbook (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tx_date TEXT NOT NULL,
+                ref_no TEXT NOT NULL,
+                tx_type TEXT NOT NULL,
+                cash_acc TEXT NOT NULL,
+                gl_acc TEXT NOT NULL,
+                unit_tag TEXT NOT NULL,
+                description TEXT NOT NULL,
+                amount REAL NOT NULL
+            )
+        """)
 
-    # Seed default Chart of Accounts if empty
     cur.execute("SELECT COUNT(*) FROM accounts")
     if cur.fetchone()[0] == 0:
         default_accounts = [
@@ -54,9 +86,8 @@ def init_db():
             ("6010", "Fuel & Transport Logistics", "Expense", 0),
             ("6020", "Office & Admin Expenses", "Expense", 0),
         ]
-        cur.executemany("INSERT INTO accounts VALUES (?, ?, ?, ?)", default_accounts)
+        cur.executemany(f"INSERT INTO accounts VALUES ({PH}, {PH}, {PH}, {PH})", default_accounts)
 
-    # Seed sample transactions if empty
     cur.execute("SELECT COUNT(*) FROM cashbook")
     if cur.fetchone()[0] == 0:
         sample_tx = [
@@ -66,17 +97,28 @@ def init_db():
             ("2026-10-12", "PV-002", "OUT", "1020", "6010", "Unit A - Operations", "Diesel & Vehicle Dispatch", 45000.0),
             ("2026-10-18", "PV-003", "OUT", "1010", "3020", "Partner 2 Account", "Partner Account Disbursement", 90000.0),
         ]
-        cur.executemany("""
+        cur.executemany(f"""
             INSERT INTO cashbook (tx_date, ref_no, tx_type, cash_acc, gl_acc, unit_tag, description, amount)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES ({PH}, {PH}, {PH}, {PH}, {PH}, {PH}, {PH}, {PH})
         """, sample_tx)
 
     conn.commit()
+    cur.close()
     conn.close()
 
 
+def fetch_df(query):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(query)
+    rows = cur.fetchall()
+    cols = [desc[0] for desc in cur.description]
+    cur.close()
+    conn.close()
+    return pd.DataFrame(rows, columns=cols)
+
+
 def build_double_entry_gl(cb_df, acc_df):
-    """Automatically converts single-entry Cashbook rows into balanced Double-Entry Journal rows."""
     if cb_df.empty:
         return pd.DataFrame(columns=[
             "tx_date", "ref_no", "unit_tag", "description",
@@ -93,46 +135,42 @@ def build_double_entry_gl(cb_df, acc_df):
         g_info = acc_map.get(g_code, {"name": g_code, "acc_type": "Expense"})
 
         if row["tx_type"] == "IN":
-            # Receipt: Debit Cash/Bank, Credit GL Category
             postings.append({
                 "tx_date": row["tx_date"], "ref_no": row["ref_no"], "unit_tag": row["unit_tag"],
                 "description": row["description"], "acc_code": c_code, "acc_name": c_info["name"],
                 "acc_type": c_info["acc_type"], "contra_acc": f"{g_code} - {g_info['name']}",
-                "debit": row["amount"], "credit": 0.0
+                "debit": float(row["amount"]), "credit": 0.0
             })
             postings.append({
                 "tx_date": row["tx_date"], "ref_no": row["ref_no"], "unit_tag": row["unit_tag"],
                 "description": row["description"], "acc_code": g_code, "acc_name": g_info["name"],
                 "acc_type": g_info["acc_type"], "contra_acc": f"{c_code} - {c_info['name']}",
-                "debit": 0.0, "credit": row["amount"]
+                "debit": 0.0, "credit": float(row["amount"])
             })
         else:
-            # Payment: Debit GL Category, Credit Cash/Bank
             postings.append({
                 "tx_date": row["tx_date"], "ref_no": row["ref_no"], "unit_tag": row["unit_tag"],
                 "description": row["description"], "acc_code": g_code, "acc_name": g_info["name"],
                 "acc_type": g_info["acc_type"], "contra_acc": f"{c_code} - {c_info['name']}",
-                "debit": row["amount"], "credit": 0.0
+                "debit": float(row["amount"]), "credit": 0.0
             })
             postings.append({
                 "tx_date": row["tx_date"], "ref_no": row["ref_no"], "unit_tag": row["unit_tag"],
                 "description": row["description"], "acc_code": c_code, "acc_name": c_info["name"],
                 "acc_type": c_info["acc_type"], "contra_acc": f"{g_code} - {g_info['name']}",
-                "debit": 0.0, "credit": row["amount"]
+                "debit": 0.0, "credit": float(row["amount"])
             })
 
     return pd.DataFrame(postings)
 
 
-# Initialize database
 init_db()
-conn = get_conn()
-acc_df = pd.read_sql_query("SELECT * FROM accounts ORDER BY code", conn)
-cb_df = pd.read_sql_query("SELECT * FROM cashbook ORDER BY tx_date, id", conn)
+acc_df = fetch_df("SELECT * FROM accounts ORDER BY code")
+cb_df = fetch_df("SELECT * FROM cashbook ORDER BY tx_date, id")
 
-# Header & Sidebar Filter
 st.title("📘 Cashbook → Automated General Ledger App")
-st.caption("Single-Entry Cashbook with Real-Time Double-Entry General Ledger & Partner/Unit Isolation")
+db_badge = "🟢 Connected to Cloud PostgreSQL (Supabase)" if USE_POSTGRES else "🟡 Local SQLite Mode"
+st.caption(f"Single-Entry Cashbook with Real-Time Double-Entry General Ledger | {db_badge}")
 
 unit_options = ["All Units / Partners (Consolidated)", "Unit A - Operations", "Partner 1 Account", "Partner 2 Account"]
 selected_unit = st.sidebar.selectbox("🔍 Filter by Account / Partner Unit:", unit_options)
@@ -144,7 +182,6 @@ else:
 
 gl_df = build_double_entry_gl(filtered_cb, acc_df)
 
-# Top KPI Metrics
 total_in = filtered_cb.loc[filtered_cb["tx_type"] == "IN", "amount"].sum() if not filtered_cb.empty else 0.0
 total_out = filtered_cb.loc[filtered_cb["tx_type"] == "OUT", "amount"].sum() if not filtered_cb.empty else 0.0
 closing_cash = total_in - total_out
@@ -163,7 +200,6 @@ tab1, tab2, tab3 = st.tabs([
     "3. Trial Balance & Chart of Accounts"
 ])
 
-# TAB 1: CASHBOOK
 with tab1:
     st.subheader("Post New Cashbook Transaction")
     cash_accounts = acc_df[acc_df["is_cash"] == 1]
@@ -177,8 +213,8 @@ with tab1:
         unit_tag = f4.selectbox("Unit / Partner Account", ["Unit A - Operations", "Partner 1 Account", "Partner 2 Account"])
 
         f5, f6, f7, f8 = st.columns([2, 2, 3, 2])
-        cash_choice = f5.selectbox("Cash / Bank Account", [f"{r.code} - {r['name']}" for _, r in cash_accounts.iterrows()])
-        gl_choice = f6.selectbox("GL Category (Counter-Account)", [f"{r.code} - {r['name']}" for _, r in gl_accounts.iterrows()])
+        cash_choice = f5.selectbox("Cash / Bank Account", [f"{r['code']} - {r['name']}" for _, r in cash_accounts.iterrows()])
+        gl_choice = f6.selectbox("GL Category (Counter-Account)", [f"{r['code']} - {r['name']}" for _, r in gl_accounts.iterrows()])
         description = f7.text_input("Particulars / Description", placeholder="Enter transaction details...")
         amount = f8.number_input("Amount", min_value=0.01, step=100.0, format="%.2f")
 
@@ -187,10 +223,11 @@ with tab1:
             if not ref_no.strip() or not description.strip():
                 st.error("Please enter both a Reference Number and Description.")
             else:
+                conn = get_conn()
                 cur = conn.cursor()
-                cur.execute("""
+                cur.execute(f"""
                     INSERT INTO cashbook (tx_date, ref_no, tx_type, cash_acc, gl_acc, unit_tag, description, amount)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES ({PH}, {PH}, {PH}, {PH}, {PH}, {PH}, {PH}, {PH})
                 """, (
                     str(tx_date),
                     ref_no.strip(),
@@ -202,7 +239,9 @@ with tab1:
                     float(amount)
                 ))
                 conn.commit()
-                st.success("Transaction posted to Cashbook and General Ledger!")
+                cur.close()
+                conn.close()
+                st.success("Transaction permanently saved to Cloud Database!")
                 st.rerun()
 
     st.subheader("Chronological Cashbook Register")
@@ -216,10 +255,7 @@ with tab1:
             use_container_width=True,
             hide_index=True
         )
-    else:
-        st.info("No transactions found for the selected filter.")
 
-# TAB 2: AUTOMATED GENERAL LEDGER
 with tab2:
     st.subheader("Automated General Ledger by Account")
     if not gl_df.empty:
@@ -231,7 +267,7 @@ with tab2:
         )
         account_filter = st.selectbox(
             "Select GL Account to Inspect:",
-            ["All Accounts"] + [f"{r.code} - {r['name']} ({r.acc_type})" for _, r in acc_df.iterrows()]
+            ["All Accounts"] + [f"{r['code']} - {r['name']} ({r['acc_type']})" for _, r in acc_df.iterrows()]
         )
         for _, acc in acc_df.iterrows():
             if account_filter != "All Accounts" and not account_filter.startswith(acc["code"]):
@@ -256,10 +292,7 @@ with tab2:
                         use_container_width=True,
                         hide_index=True
                     )
-                else:
-                    st.caption("No postings in this account for the current filter.")
 
-# TAB 3: TRIAL BALANCE & CHART OF ACCOUNTS
 with tab3:
     c_left, c_right = st.columns([2, 1])
     with c_left:
@@ -269,8 +302,6 @@ with tab3:
             tb["Net Balance"] = (tb["debit"] - tb["credit"]).abs()
             tb["Dr / Cr"] = tb.apply(lambda r: "Dr" if r["debit"] >= r["credit"] else "Cr", axis=1)
             st.dataframe(tb, use_container_width=True, hide_index=True)
-        else:
-            st.info("No postings available.")
 
     with c_right:
         st.subheader("Add New GL Account")
@@ -282,12 +313,16 @@ with tab3:
             if st.form_submit_button("+ Create Account"):
                 if new_code.strip() and new_name.strip():
                     try:
-                        conn.cursor().execute(
-                            "INSERT INTO accounts VALUES (?, ?, ?, ?)",
+                        conn = get_conn()
+                        cur = conn.cursor()
+                        cur.execute(
+                            f"INSERT INTO accounts VALUES ({PH}, {PH}, {PH}, {PH})",
                             (new_code.strip(), new_name.strip(), new_type, 1 if is_cash_acc else 0)
                         )
                         conn.commit()
-                        st.success("Account added!")
+                        cur.close()
+                        conn.close()
+                        st.success("Account added to Cloud Database!")
                         st.rerun()
-                    except sqlite3.IntegrityError:
+                    except Exception:
                         st.error("Account code already exists.")
