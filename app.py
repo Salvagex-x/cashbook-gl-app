@@ -1,590 +1,697 @@
+"""
+KONEK Cashbook -> Automated General Ledger   (version 2)
+
+Screens:  1 Cashbook  2 Journal & Opening balances  3 General ledger
+          4 Trial balance  5 Vouchers & reversals  6 Chart of accounts  7 Audit log
+Files:    db.py (database)  service.py (rules)  reports.py (reports)
+          auth.py (login)   coa_import.py (upload reader)  coa_defaults.py (starter data)
+"""
 import os
-import sqlite3
-from datetime import date
+import time
+from datetime import timedelta
+
 import pandas as pd
 import streamlit as st
 
-try:
-    import psycopg2
-except ImportError:
-    psycopg2 = None
+import auth
+import coa_import
+import reports
+import service as S
+from coa_defaults import ACCOUNT_TYPES, DEFAULT_COA
+from db import Database
+from money import fmt, to_kobo
+from service import LedgerError
 
-st.set_page_config(page_title="KONEK Cashbook & General Ledger", layout="wide")
+APP_TITLE = "KONEK Cashbook \u2192 Automated General Ledger"
+COMPANY = "KONEK Investment & Services Ltd"
+VERSION = "2.1"
+CUR = "\u20a6"
+ALL_DEPTS = "All Departments (Consolidated)"
+XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+st.set_page_config(page_title="KONEK Cashbook & GL", page_icon="\U0001F4D8", layout="wide")
 
 
-def get_db_url():
+# ============================================================ small helpers
+def secret(key, default=None):
+    """Read a setting from Streamlit secrets, then from environment variables."""
     try:
-        if "DATABASE_URL" in st.secrets:
-            return st.secrets["DATABASE_URL"]
+        return st.secrets[key]
     except Exception:
-        pass
-    return os.environ.get("DATABASE_URL")
+        return os.environ.get(key, default)
 
 
-DB_URL = get_db_url()
-USE_POSTGRES = bool(DB_URL and psycopg2 is not None)
-PH = "%s" if USE_POSTGRES else "?"
-
-# All 115 Accounts extracted directly from KONEK COA UPDATE_085213.xlsx
-KONEK_DEFAULT_COA = [
-    ("11001", "Land & Buildings", "Asset", 0),
-    ("11002", "Plant & Machinery", "Asset", 0),
-    ("11003", "Office Equipment", "Asset", 0),
-    ("11004", "Furniture & Fittings", "Asset", 0),
-    ("11005", "Motor Vehicles", "Asset", 0),
-    ("11006", "IT Infrastruction", "Asset", 0),
-    ("11011", "Accum. Depreciation - Land & Buildings", "Asset", 0),
-    ("11012", "Accum. Depreciation - Plant & Machinery", "Asset", 0),
-    ("11013", "Accum. Depreciation - Office Equipment", "Asset", 0),
-    ("11014", "Accum. Depreciation - Furniture & Fittings", "Asset", 0),
-    ("11015", "Accum. Depreciation - Motor Vehicles", "Asset", 0),
-    ("11016", "Accum. Depreciation - IT Infrastruction", "Asset", 0),
-    ("12001", "Construction Materials", "Asset", 0),
-    ("12002", "IT Infrastruction (Inventory)", "Asset", 0),
-    ("12003", "Oil & Gas", "Asset", 0),
-    ("12004", "General Supply", "Asset", 0),
-    ("12011", "Goods in Transit", "Asset", 0),
-    ("12012", "Consumables", "Asset", 0),
-    ("13001", "Trade Debtors control account", "Asset", 0),
-    ("13002", "Construction customers Receivable", "Asset", 0),
-    ("13003", "Trade Debtors - IT receivable customers", "Asset", 0),
-    ("13004", "Trade Debtors oil & gas", "Asset", 0),
-    ("13005", "Trade debtors general supplies receivable", "Asset", 0),
-    ("13006", "Retention Receivable", "Asset", 0),
-    ("13007", "Contract Assets/Work certified not yet billed", "Asset", 0),
-    ("13008", "Other receivables", "Asset", 0),
-    ("13011", "Staff Loan and Advances", "Asset", 0),
-    ("13012", "Prepaid Expenses", "Asset", 0),
-    ("13013", "Withholding Tax Credits", "Asset", 0),
-    ("14001", "ZENITH BANK", "Asset", 1),
-    ("14002", "FIRST BANK", "Asset", 1),
-    ("14003", "GTB", "Asset", 1),
-    ("14011", "Petty Cash", "Asset", 1),
-    ("21001", "Trade Creditor Control Account", "Liability", 0),
-    ("21002", "Trade Creditor - Construction Material Suppliers", "Liability", 0),
-    ("21003", "Trade Creditor - IT Equipment supplier", "Liability", 0),
-    ("21004", "Trade Creditor - OIL & Gas suppliers", "Liability", 0),
-    ("21005", "Trade Creditor - General Suppliers", "Liability", 0),
-    ("21006", "Subcontractors payable", "Liability", 0),
-    ("21007", "Accrued Expenses", "Liability", 0),
-    ("21008", "Other payables", "Liability", 0),
-    ("21009", "Supplier deposit received", "Liability", 0),
-    ("21011", "Accrued Expense - Utilties", "Liability", 0),
-    ("21012", "Accrued Expense - Audit Fees", "Liability", 0),
-    ("21013", "Accrued Expense - Consultancy", "Liability", 0),
-    ("21014", "Accrued Taxes", "Liability", 0),
-    ("21015", "Unremmited Deductions", "Liability", 0),
-    ("21021", "Directors' Current Account", "Liability", 0),
-    ("22001", "Bank Loan", "Liability", 0),
-    ("22002", "Bank Loan - Access Bank", "Liability", 0),
-    ("22011", "Directors' Loan", "Liability", 0),
-    ("22012", "Other Long Term Facility", "Liability", 0),
-    ("23001", "Share Capital", "Equity", 0),
-    ("23011", "Retained Earnings", "Equity", 0),
-    ("23021", "Directors' Fund", "Equity", 0),
-    ("31000", "Sales - Construction for project X", "Revenue", 0),
-    ("32000", "Sales - Construction for project Y", "Revenue", 0),
-    ("33000", "Sales - IT infrastructure", "Revenue", 0),
-    ("34000", "Sales - Oil & Gas", "Revenue", 0),
-    ("35000", "Sales - General Services", "Revenue", 0),
-    ("31011", "Other Income", "Revenue", 0),
-    ("41001", "Direct Material Project X", "Expense", 0),
-    ("41010", "Direct Material Project Y", "Expense", 0),
-    ("41020", "Purchases - Oil & Gas", "Expense", 0),
-    ("41030", "Purchases - General Supplies", "Expense", 0),
-    ("41100", "Direct Labour Construction workers", "Expense", 0),
-    ("41101", "Direct Labour - Masons", "Expense", 0),
-    ("41102", "Direct Labour - Carpenters", "Expense", 0),
-    ("41103", "Direct Labour - Steel Fixers", "Expense", 0),
-    ("41104", "Direct Labour - Electricians", "Expense", 0),
-    ("41105", "Direct Labour - Plumbers", "Expense", 0),
-    ("41106", "Direct Labour - Welders/Fabricators", "Expense", 0),
-    ("41107", "Direct Labour - Painters", "Expense", 0),
-    ("41108", "Direct Labour - Tiles", "Expense", 0),
-    ("41109", "Direct Labour - POP/Ceiling Installers", "Expense", 0),
-    ("41110", "Direct Labour - Equipment Operators", "Expense", 0),
-    ("41111", "Direct Labour - General Labourers/Casual Workers", "Expense", 0),
-    ("41120", "DIRECT LABOUR PROJECT Y", "Expense", 0),
-    ("41130", "Direct Labour - IT Engineers & Technicians", "Expense", 0),
-    ("41140", "Direct Labour - CCTV/Network Installers", "Expense", 0),
-    ("41150", "Direct Labour - Oil & Gas Field Technicians", "Expense", 0),
-    ("41161", "Direct Labour - Overtime", "Expense", 0),
-    ("41162", "Consumables office", "Expense", 0),
-    ("41163", "Diesel, Fuel and Lubricants", "Expense", 0),
-    ("41164", "Electricity", "Expense", 0),
-    ("41165", "Office Repairs and Maintenance", "Expense", 0),
-    ("41166", "Maintenance", "Expense", 0),
-    ("42001", "Salaries and Wages", "Expense", 0),
-    ("42002", "Staff Welfare", "Expense", 0),
-    ("42003", "Audit fees", "Expense", 0),
-    ("42004", "Utility", "Expense", 0),
-    ("42005", "Communication and Subscriptions", "Expense", 0),
-    ("42006", "Fuel for motor vehicles", "Expense", 0),
-    ("42007", "Printing and Stationery", "Expense", 0),
-    ("42008", "Motor Vehicles Repairs & Maintenance", "Expense", 0),
-    ("42009", "Security Expenses", "Expense", 0),
-    ("42010", "General Expenses", "Expense", 0),
-    ("42011", "Directors Remuneration", "Expense", 0),
-    ("42012", "Business Promotion & Publicity", "Expense", 0),
-    ("42013", "Transport & Travel", "Expense", 0),
-    ("42014", "Bank Charges", "Expense", 0),
-    ("42015", "Interest on Loan & Overdrafts", "Expense", 0),
-    ("42016", "Insurance expense", "Expense", 0),
-    ("42017", "Statutory Compliance Expenses", "Expense", 0),
-    ("42018", "Cleaning & Sanitation Expense", "Expense", 0),
-    ("42019", "Hotel & Accommodation", "Expense", 0),
-    ("42020", "Miscellaneous expense", "Expense", 0),
-    ("42021", "Annual Regulatory Dues", "Expense", 0),
-    ("42022", "Office service charge", "Expense", 0),
-    ("43011", "Depreciation - Land & Buildings", "Expense", 0),
-    ("43012", "Depreciation - Plant & Machinery", "Expense", 0),
-    ("43013", "Depreciation - Office Equipment", "Expense", 0),
-    ("43014", "Depreciation - Furniture & Fittings", "Expense", 0),
-    ("43015", "Depreciation - Motor Vehicles", "Expense", 0),
-    ("43016", "Depreciation - IT Infrastruction", "Expense", 0),
-]
+def show_table(df: pd.DataFrame, money_cols=(), height=None):
+    styled = df.style.format({c: "{:,.2f}" for c in money_cols if c in df.columns}, na_rep="")
+    extra = {"height": height} if height else {}
+    st.dataframe(styled, hide_index=True, width="stretch", **extra)
 
 
-def get_conn():
-    if USE_POSTGRES:
-        return psycopg2.connect(DB_URL)
-    return sqlite3.connect("ledger_data.db", check_same_thread=False)
+def download_excel(label: str, sheets: dict, filename: str, key: str):
+    st.download_button(label, data=reports.to_excel_bytes(sheets), file_name=filename,
+                       mime=XLSX, key=key)
 
 
-def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS accounts (
-            code TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            acc_type TEXT NOT NULL,
-            is_cash INTEGER NOT NULL DEFAULT 0
-        )
-    """)
-
-    if USE_POSTGRES:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS cashbook (
-                id SERIAL PRIMARY KEY,
-                tx_date TEXT NOT NULL,
-                ref_no TEXT NOT NULL,
-                tx_type TEXT NOT NULL,
-                cash_acc TEXT NOT NULL,
-                gl_acc TEXT NOT NULL,
-                unit_tag TEXT NOT NULL,
-                description TEXT NOT NULL,
-                amount DOUBLE PRECISION NOT NULL
-            )
-        """)
-    else:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS cashbook (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                tx_date TEXT NOT NULL,
-                ref_no TEXT NOT NULL,
-                tx_type TEXT NOT NULL,
-                cash_acc TEXT NOT NULL,
-                gl_acc TEXT NOT NULL,
-                unit_tag TEXT NOT NULL,
-                description TEXT NOT NULL,
-                amount REAL NOT NULL
-            )
-        """)
-
-    cur.execute("SELECT COUNT(*) FROM accounts")
-    if cur.fetchone()[0] == 0:
-        cur.executemany(
-            f"INSERT INTO accounts VALUES ({PH}, {PH}, {PH}, {PH})",
-            KONEK_DEFAULT_COA
-        )
-
-    conn.commit()
-    cur.close()
-    conn.close()
+def form_version() -> int:
+    return st.session_state.setdefault("form_ver", 0)
 
 
-def fetch_df(query):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(query)
-    rows = cur.fetchall()
-    cols = [desc[0] for desc in cur.description]
-    cur.close()
-    conn.close()
-    return pd.DataFrame(rows, columns=cols)
+def finish_and_refresh(kind: str, message: str):
+    """Show a message on the next screen, give the forms fresh empty fields, reload."""
+    if kind == "success" and "\u26a0" in message:
+        kind = "warning"
+    st.session_state["_flash"] = (kind, message)
+    st.session_state["form_ver"] = form_version() + 1
+    st.rerun()
 
 
-def smart_parse_coa_df(raw_df):
-    df = raw_df.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
-    if df.shape[1] < 2:
-        return []
-
-    cols = df.columns.tolist()
-    code_col, name_col = cols[0], cols[1]
-    imported = []
-    current_section = "Expense"
-    is_cash_section = 0
-
-    for _, r in df.iterrows():
-        raw_c = str(r[code_col]).strip() if pd.notna(r[code_col]) else ""
-        raw_n = str(r[name_col]).strip() if pd.notna(r[name_col]) else ""
-        if raw_c.endswith(".0"):
-            raw_c = raw_c[:-2]
-
-        if (not raw_c or raw_c.lower() == "nan") and raw_n and raw_n.lower() != "nan":
-            sec_lower = raw_n.lower()
-            if any(k in sec_lower for k in ["bank", "cash"]):
-                current_section = "Asset"
-                is_cash_section = 1
-            elif any(k in sec_lower for k in ["asset", "inventor", "debtor", "receiv", "prepay"]):
-                current_section = "Asset"
-                is_cash_section = 0
-            elif any(k in sec_lower for k in ["creditor", "liabil", "payable", "loan"]):
-                current_section = "Liability"
-                is_cash_section = 0
-            elif any(k in sec_lower for k in ["equit", "capital", "fund"]):
-                current_section = "Equity"
-                is_cash_section = 0
-            elif any(k in sec_lower for k in ["rev", "sales", "income"]):
-                current_section = "Revenue"
-                is_cash_section = 0
-            elif any(k in sec_lower for k in ["cost", "expense", "overhead"]):
-                current_section = "Expense"
-                is_cash_section = 0
-            continue
-
-        if not raw_c or not raw_n or raw_c.lower() in ["nan", "account code", "code", "gl code"] or raw_n.lower() in ["nan", "account name", "description"]:
-            continue
-
-        name_clean = " ".join(raw_n.split())
-        acc_type = current_section
-        is_cash = is_cash_section
-        if raw_c.startswith("14") or any(k in name_clean.lower() for k in ["zenith", "first bank", "gtb", "petty cash", "cash at bank"]):
-            if not raw_c.startswith("22"):
-                acc_type = "Asset"
-                is_cash = 1
-
-        imported.append((raw_c, name_clean, acc_type, is_cash))
-    return imported
+def show_flash():
+    item = st.session_state.pop("_flash", None)
+    if item:
+        {"success": st.success, "warning": st.warning, "error": st.error}[item[0]](item[1])
 
 
-def build_double_entry_gl(cb_df, acc_df):
-    if cb_df.empty:
-        return pd.DataFrame(columns=[
-            "tx_date", "ref_no", "unit_tag", "description",
-            "acc_code", "acc_name", "acc_type", "contra_acc", "debit", "credit"
-        ])
+LABEL_STYLES = {
+    "Code + type (compact)": "code_type",
+    "Code only": "code",
+    "Code + name + type": "full",
+}
 
-    acc_map = acc_df.set_index("code").to_dict("index")
-    postings = []
 
-    for _, row in cb_df.iterrows():
-        c_code = str(row["cash_acc"])
-        g_code = str(row["gl_acc"])
-        c_info = acc_map.get(c_code, {"name": c_code, "acc_type": "Asset"})
-        g_info = acc_map.get(g_code, {"name": g_code, "acc_type": "Expense"})
+def options_for(df: pd.DataFrame, style: str = "full") -> dict:
+    """Dropdown choices {label: code}. style: 'code', 'code_type' or 'full'."""
+    if style == "code":
+        return {f"{r.code}": r.code for r in df.itertuples()}
+    if style == "code_type":
+        return {f"{r.code} \u00b7 {r.acc_type}": r.code for r in df.itertuples()}
+    return {f"{r.code} - {r.name}  [{r.acc_type}]": r.code for r in df.itertuples()}
 
-        if row["tx_type"] == "IN":
-            postings.append({
-                "tx_date": row["tx_date"], "ref_no": row["ref_no"], "unit_tag": row["unit_tag"],
-                "description": row["description"], "acc_code": c_code, "acc_name": c_info["name"],
-                "acc_type": c_info["acc_type"], "contra_acc": f"{g_code} - {g_info['name']}",
-                "debit": float(row["amount"]), "credit": 0.0
-            })
-            postings.append({
-                "tx_date": row["tx_date"], "ref_no": row["ref_no"], "unit_tag": row["unit_tag"],
-                "description": row["description"], "acc_code": g_code, "acc_name": g_info["name"],
-                "acc_type": g_info["acc_type"], "contra_acc": f"{c_code} - {c_info['name']}",
-                "debit": 0.0, "credit": float(row["amount"])
-            })
+
+def audit_event(user: str, action: str, detail: str = ""):
+    try:
+        with db.tx() as t:
+            S.log_audit(t, user, action, detail)
+    except Exception:
+        pass  # never block a login because the log could not be written
+
+
+# ============================================================== database
+DB_URL = secret("DATABASE_URL")
+
+
+@st.cache_resource(show_spinner="Connecting to the database\u2026")
+def get_db(url):
+    return Database(url or None).init_schema()
+
+
+try:
+    db = get_db(DB_URL)
+except Exception as exc:
+    st.title("\U0001F4D8 " + APP_TITLE)
+    st.error("Could not connect to the database. Check the DATABASE_URL in the app secrets "
+             "and that your Supabase project is not paused.")
+    st.caption(f"Technical detail: {type(exc).__name__}")
+    st.stop()
+
+
+# ================================================================== login
+def login_screen(users: dict):
+    st.title("\U0001F4D8 " + APP_TITLE)
+    st.caption(COMPANY)
+    if not users:
+        st.error("No users are set up yet, so the app is locked.")
+        st.markdown("Add at least one `[users.yourname]` section (with `name`, `role` and "
+                    "`password_hash`) to the app **Secrets**, then reload. "
+                    "The step-by-step guide explains how.")
+        st.stop()
+    _, mid, _ = st.columns([1, 1.2, 1])
+    with mid.form("login"):
+        st.subheader("Sign in")
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        go = st.form_submit_button("Sign in", type="primary")
+    if go:
+        wait = st.session_state.get("locked_until", 0) - time.time()
+        if wait > 0:
+            mid.error(f"Too many wrong attempts. Please wait {int(wait) + 1} seconds.")
         else:
-            postings.append({
-                "tx_date": row["tx_date"], "ref_no": row["ref_no"], "unit_tag": row["unit_tag"],
-                "description": row["description"], "acc_code": g_code, "acc_name": g_info["name"],
-                "acc_type": g_info["acc_type"], "contra_acc": f"{c_code} - {c_info['name']}",
-                "debit": float(row["amount"]), "credit": 0.0
-            })
-            postings.append({
-                "tx_date": row["tx_date"], "ref_no": row["ref_no"], "unit_tag": row["unit_tag"],
-                "description": row["description"], "acc_code": c_code, "acc_name": c_info["name"],
-                "acc_type": c_info["acc_type"], "contra_acc": f"{g_code} - {g_info['name']}",
-                "debit": 0.0, "credit": float(row["amount"])
-            })
-
-    return pd.DataFrame(postings)
-
-
-init_db()
-acc_df = fetch_df("SELECT * FROM accounts ORDER BY code")
-cb_df = fetch_df("SELECT * FROM cashbook ORDER BY tx_date, id")
-
-st.title("📘 KONEK Cashbook → Automated General Ledger")
-db_badge = "🟢 Cloud Database Connected" if USE_POSTGRES else "🟡 Local Mode"
-st.caption(f"KONEK Investment & Services Ltd — Daily Cashbook & Double-Entry General Ledger | {db_badge}")
-
-default_divisions = [
-    "General / Head Office",
-    "Construction - Project X",
-    "Construction - Project Y",
-    "IT Infrastructure",
-    "Oil & Gas",
-    "General Supply & Services",
-    "Agric Operations"
-]
-existing_divs = [d for d in cb_df["unit_tag"].dropna().unique().tolist() if d not in default_divisions] if not cb_df.empty else []
-all_divisions = default_divisions + existing_divs
-
-selected_div = st.sidebar.selectbox(
-    "🏢 Filter by Project / Department:",
-    ["All Departments (Consolidated)"] + all_divisions
-)
-
-if selected_div != "All Departments (Consolidated)":
-    filtered_cb = cb_df[cb_df["unit_tag"] == selected_div].copy()
-else:
-    filtered_cb = cb_df.copy()
-
-gl_df = build_double_entry_gl(filtered_cb, acc_df)
-
-total_in = filtered_cb.loc[filtered_cb["tx_type"] == "IN", "amount"].sum() if not filtered_cb.empty else 0.0
-total_out = filtered_cb.loc[filtered_cb["tx_type"] == "OUT", "amount"].sum() if not filtered_cb.empty else 0.0
-closing_cash = total_in - total_out
-total_dr = gl_df["debit"].sum() if not gl_df.empty else 0.0
-total_cr = gl_df["credit"].sum() if not gl_df.empty else 0.0
-
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Closing Cash & Bank Balance", f"{closing_cash:,.2f}")
-col2.metric("Total Receipts (Money In)", f"{total_in:,.2f}")
-col3.metric("Total Payments (Money Out)", f"{total_out:,.2f}")
-col4.metric("Ledger Status", "BALANCED ✓" if round(total_dr, 2) == round(total_cr, 2) else "UNBALANCED", f"Dr = Cr ({total_dr:,.2f})")
-
-tab1, tab2, tab3, tab4 = st.tabs([
-    "1. Daily Cashbook Entry",
-    "2. Automated General Ledger",
-    "3. Trial Balance",
-    "4. ⚙️ Manage / Upload Chart of Accounts"
-])
-
-with tab1:
-    st.subheader("Record Daily Cash / Bank Transaction")
-    cash_accounts = acc_df[acc_df["is_cash"] == 1]
-    gl_accounts = acc_df[acc_df["is_cash"] == 0]
-
-    if cash_accounts.empty:
-        cash_accounts = acc_df
-    if gl_accounts.empty:
-        gl_accounts = acc_df
-
-    with st.form("cashbook_form", clear_on_submit=True):
-        f1, f2, f3, f4 = st.columns(4)
-        tx_date = f1.date_input("Transaction Date", value=date.today())
-        ref_no = f2.text_input("Voucher / Receipt No.", placeholder="e.g. PV-001 or RC-001")
-        tx_type = f3.selectbox("Transaction Type", ["OUT - Payment (Money Out)", "IN - Receipt (Money In)"])
-        unit_tag = f4.selectbox("Project / Department", all_divisions)
-
-        f5, f6, f7, f8 = st.columns([2, 2, 3, 2])
-        cash_choice = f5.selectbox(
-            "Bank / Cash Account (14001-14011)",
-            [f"{r['code']} - {r['name']}" for _, r in cash_accounts.iterrows()]
-        )
-        gl_choice = f6.selectbox(
-            "Chart of Accounts Head",
-            [f"{r['code']} - {r['name']} ({r['acc_type']})" for _, r in gl_accounts.iterrows()]
-        )
-        description = f7.text_input("Description / Particulars", placeholder="Enter transaction details...")
-        amount = f8.number_input("Amount", min_value=0.01, step=500.0, format="%.2f")
-
-        submitted = st.form_submit_button("+ Post Transaction to Cashbook & General Ledger")
-        if submitted:
-            if not ref_no.strip() or not description.strip():
-                st.error("Please enter both a Voucher/Receipt Number and Description.")
-            else:
-                conn = get_conn()
-                cur = conn.cursor()
-                cur.execute(f"""
-                    INSERT INTO cashbook (tx_date, ref_no, tx_type, cash_acc, gl_acc, unit_tag, description, amount)
-                    VALUES ({PH}, {PH}, {PH}, {PH}, {PH}, {PH}, {PH}, {PH})
-                """, (
-                    str(tx_date),
-                    ref_no.strip(),
-                    "IN" if tx_type.startswith("IN") else "OUT",
-                    cash_choice.split(" - ")[0],
-                    gl_choice.split(" - ")[0],
-                    unit_tag,
-                    description.strip(),
-                    float(amount)
-                ))
-                conn.commit()
-                cur.close()
-                conn.close()
-                st.success("Transaction posted to Cashbook and General Ledger!")
+            user = auth.authenticate(users, username, password)
+            if user:
+                st.session_state.update(user=user, fails=0)
+                audit_event(user["username"], "LOGIN")
                 st.rerun()
+            fails = st.session_state.get("fails", 0) + 1
+            st.session_state["fails"] = fails
+            if fails >= 5:
+                st.session_state.update(locked_until=time.time() + 60, fails=0)
+            if (username or "").strip().lower() in users:
+                audit_event((username or "").strip().lower(), "LOGIN_FAILED")
+            mid.error("Wrong username or password.")
+    st.stop()
 
-    st.subheader("Cashbook Transaction Register")
-    if not filtered_cb.empty:
-        disp_cb = filtered_cb.copy()
-        disp_cb["Receipt (In)"] = disp_cb.apply(lambda r: r["amount"] if r["tx_type"] == "IN" else 0.0, axis=1)
-        disp_cb["Payment (Out)"] = disp_cb.apply(lambda r: r["amount"] if r["tx_type"] == "OUT" else 0.0, axis=1)
-        disp_cb["Running Balance"] = (disp_cb["Receipt (In)"] - disp_cb["Payment (Out)"]).cumsum()
-        st.dataframe(
-            disp_cb[["id", "tx_date", "ref_no", "unit_tag", "description", "cash_acc", "gl_acc", "Receipt (In)", "Payment (Out)", "Running Balance"]],
-            use_container_width=True,
-            hide_index=True
-        )
 
-        with st.expander("🗑️ Delete or Clear Transactions"):
-            c_del1, c_del2 = st.columns(2)
-            del_id = c_del1.number_input("Enter Transaction ID to delete:", min_value=1, step=1)
-            if c_del1.button("Delete Selected Transaction ID"):
-                conn = get_conn()
-                cur = conn.cursor()
-                cur.execute(f"DELETE FROM cashbook WHERE id = {PH}", (int(del_id),))
-                conn.commit()
-                cur.close()
-                conn.close()
-                st.success(f"Deleted transaction #{int(del_id)}")
-                st.rerun()
-            if c_del2.button("⚠️ Clear ALL Cashbook Demo Transactions"):
-                conn = get_conn()
-                cur = conn.cursor()
-                cur.execute("DELETE FROM cashbook")
-                conn.commit()
-                cur.close()
-                conn.close()
-                st.success("All Cashbook transactions cleared!")
-                st.rerun()
-    else:
-        st.info("No Cashbook transactions recorded yet. Use the form above to enter your first Receipt or Payment.")
+def require_login() -> dict:
+    if st.session_state.get("user"):
+        return st.session_state["user"]
+    users = auth.clean_users(secret("users", {}))
+    if not users and not db.is_pg:   # local testing only: no login needed
+        st.session_state["user"] = {"username": "local", "name": "Local tester", "role": "admin"}
+        return st.session_state["user"]
+    login_screen(users)
 
-with tab2:
-    st.subheader("Automated General Ledger (By Account Head)")
-    if not gl_df.empty:
-        st.download_button(
-            "⬇️ Export Full General Ledger to Excel/CSV",
-            data=gl_df.to_csv(index=False).encode("utf-8"),
-            file_name="KONEK_General_Ledger.csv",
-            mime="text/csv"
-        )
-        account_filter = st.selectbox(
-            "Filter by Account Head:",
-            ["All Accounts"] + [f"{r['code']} - {r['name']} ({r['acc_type']})" for _, r in acc_df.iterrows()]
-        )
-        for _, acc in acc_df.iterrows():
-            if account_filter != "All Accounts" and not account_filter.startswith(str(acc["code"])):
-                continue
-            sub_gl = gl_df[gl_df["acc_code"] == str(acc["code"])].copy()
-            if sub_gl.empty and account_filter == "All Accounts":
-                continue
 
-            if not sub_gl.empty:
-                if acc["acc_type"] in ["Asset", "Expense"]:
-                    sub_gl["Running Balance"] = (sub_gl["debit"] - sub_gl["credit"]).cumsum()
-                else:
-                    sub_gl["Running Balance"] = (sub_gl["credit"] - sub_gl["debit"]).cumsum()
-                closing = sub_gl["Running Balance"].iloc[-1]
-            else:
-                closing = 0.0
+user = require_login()
+USER = user["username"]
+CAN_POST, CAN_REVERSE = auth.can(user, "post"), auth.can(user, "reverse")
+IS_ADMIN = auth.can(user, "coa")
 
-            with st.expander(f"📂 {acc['code']} - {acc['name']} ({acc['acc_type']}) | Closing Balance: {closing:,.2f}", expanded=True):
-                if not sub_gl.empty:
-                    st.dataframe(
-                        sub_gl[["tx_date", "ref_no", "unit_tag", "description", "contra_acc", "debit", "credit", "Running Balance"]],
-                        use_container_width=True,
-                        hide_index=True
-                    )
-    else:
-        st.info("General Ledger will populate automatically as soon as you enter transactions in Tab 1.")
-
-with tab3:
-    st.subheader("Automated Trial Balance")
-    if not gl_df.empty:
-        tb = gl_df.groupby(["acc_code", "acc_name", "acc_type"], as_index=False)[["debit", "credit"]].sum()
-        tb["Net Balance"] = (tb["debit"] - tb["credit"]).abs()
-        tb["Dr / Cr"] = tb.apply(lambda r: "Dr" if r["debit"] >= r["credit"] else "Cr", axis=1)
-        st.dataframe(tb, use_container_width=True, hide_index=True)
-    else:
-        st.info("No transactions posted yet.")
-
-with tab4:
-    st.subheader("⚙️ KONEK Chart of Accounts Manager")
-
-    st.info("💡 Click the button below to load all **115 Accounts from KONEK INVESTMENT & SERVICES LTD** (`11001` to `43016`) in one click, or upload a new Excel file anytime.")
-    if st.button("🔄 Load KONEK Investment & Services Ltd COA (115 Accounts)", type="primary"):
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM accounts")
-        cur.executemany(
-            f"INSERT INTO accounts VALUES ({PH}, {PH}, {PH}, {PH})",
-            KONEK_DEFAULT_COA
-        )
-        conn.commit()
-        cur.close()
-        conn.close()
-        st.success("Loaded all 115 KONEK Investment & Services Ltd accounts!")
+# ================================================================ sidebar
+today = S.today_local()
+with st.sidebar:
+    st.markdown(f"**{user['name']}**  \n`{user['role']}`")
+    if st.button("Sign out"):
+        audit_event(USER, "LOGOUT")
+        st.session_state.pop("user", None)
         st.rerun()
+    st.divider()
+    st.header("Reporting period")
+    picked = st.date_input("From \u2013 To", value=(today.replace(month=1, day=1), today),
+                           format="YYYY-MM-DD")
+    start, end = (picked[0], picked[-1]) if isinstance(picked, (tuple, list)) and picked else (picked, picked)
+    if start > end:
+        start, end = end, start
+    all_depts = S.departments_list(db)
+    dept_pick = st.selectbox("\U0001F3E2 Project / department", [ALL_DEPTS] + all_depts)
+    dept_filter = None if dept_pick == ALL_DEPTS else dept_pick
+    st.divider()
+    style_pick = st.radio("Account dropdown shows", list(LABEL_STYLES), key="label_style",
+                          help="In the entry forms. Reports always show the full account names. "
+                               "With 'Code only' you can no longer search by name.")
+    LABEL_STYLE = LABEL_STYLES[style_pick]
+    st.divider()
+    st.caption(f"Version {VERSION}")
 
-    st.markdown("---")
-    col_up, col_manual = st.columns([3, 2])
+# ================================================================== data
+accounts = S.accounts_df(db)
+active = accounts[accounts["is_active"] == 1]
+cash_active = options_for(active[active["is_cash"] == 1], LABEL_STYLE)
+cash_all = options_for(accounts[accounts["is_cash"] == 1])
+head_active = options_for(active[active["is_cash"] == 0], LABEL_STYLE)
+lines = S.load_lines(db, end, dept_filter)
+m = reports.header_metrics(lines, start, end)
+default_dept = all_depts.index("General / Head Office") if "General / Head Office" in all_depts else 0
 
-    with col_up:
-        st.markdown("#### 📤 Upload a New Chart of Accounts Excel/CSV File")
-        uploaded_file = st.file_uploader("Click 'Browse files' to upload an Excel (.xlsx) or CSV COA file", type=["xlsx", "xls", "csv"])
+# ================================================================== header
+st.title("\U0001F4D8 " + APP_TITLE)
+badge = "\U0001F7E2 Cloud database connected" if db.is_pg else \
+    "\U0001F7E1 LOCAL TEST MODE (data is not saved permanently)"
+st.caption(f"{COMPANY} \u2014 Daily cashbook & double-entry general ledger | {badge}")
+if db.init_warnings and IS_ADMIN:
+    st.warning("Some database safety steps could not be applied:\n\n- " + "\n- ".join(db.init_warnings))
+show_flash()
 
-        if uploaded_file is not None:
-            try:
-                if uploaded_file.name.lower().endswith(".csv"):
-                    raw_coa = pd.read_csv(uploaded_file)
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Opening Cash & Bank", fmt(m["opening"]))
+c2.metric("Receipts (Money In)", fmt(m["receipts"]))
+c3.metric("Payments (Money Out)", fmt(m["payments"]))
+c4.metric("Closing Cash & Bank", fmt(m["closing"]))
+if m["balanced"]:
+    c5.metric("Ledger Status", "BALANCED \u2713", f"Dr = Cr ({fmt(m['total_dr'])})", delta_color="off")
+else:
+    c5.metric("Ledger Status", "OUT OF BALANCE \u2717",
+              f"Dr \u2212 Cr = {fmt(m['total_dr'] - m['total_cr'])}", delta_color="inverse")
+st.caption(f"Period {start} to {end} \u00b7 {dept_pick}"
+           + (f" \u00b7 Other cash movements (transfers, opening balances and their reversals): {fmt(m['other'])}"
+              if m["other"] else ""))
+
+
+# ============================================================ 1. cashbook
+def voucher_form(kind: str):
+    prefix = "RC-" if kind == "RECEIPT" else "PV-"
+    v = form_version()
+    n = st.number_input("Number of account lines", 1, 10, 1, key=f"n_{kind}_{v}",
+                        help="Use 1 for a normal entry. Use 2 or more to split one voucher "
+                             "across several account heads.")
+    with st.form(f"form_{kind}_{v}"):
+        a, b, c, d = st.columns([1.2, 1.2, 2, 2])
+        tx_date = a.date_input("Date", value=S.today_local(), key=f"d_{kind}_{v}")
+        ref = b.text_input("Voucher no.", value=S.next_ref(db, prefix), max_chars=30, key=f"r_{kind}_{v}")
+        cash_label = c.selectbox("Bank / cash account", list(cash_active), key=f"c_{kind}_{v}")
+        dept = d.selectbox("Project / department", all_depts, index=default_dept, key=f"p_{kind}_{v}")
+        narration = st.text_input("Narration / particulars (what is this for?)", max_chars=300,
+                                  key=f"nar_{kind}_{v}")
+        st.markdown("**Account lines** \u2014 " + ("where the money came from"
+                    if kind == "RECEIPT" else "what the money was spent on"))
+        items = []
+        for i in range(int(n)):
+            x, y, z = st.columns([4, 3, 2])
+            head = x.selectbox(f"Account head {i + 1}", list(head_active), index=None,
+                               placeholder="Type to search\u2026", key=f"h_{kind}_{v}_{i}")
+            note = y.text_input(f"Line note {i + 1} (optional)", max_chars=200, key=f"ln_{kind}_{v}_{i}")
+            amt = z.number_input(f"Amount {i + 1} ({CUR})", min_value=0.0, step=100.0, format="%.2f",
+                                 key=f"a_{kind}_{v}_{i}")
+            items.append({"acc_code": head_active.get(head), "note": note, "amount_k": to_kobo(amt)})
+        go = st.form_submit_button(f"Post {kind.title()}", type="primary")
+    if go:
+        try:
+            vid, warns = S.post_cash_voucher(
+                db, kind=kind, tx_date=tx_date, ref_no=ref, cash_acc=cash_active[cash_label],
+                items=items, unit_tag=dept, narration=narration, user=USER)
+        except LedgerError as exc:
+            st.error(str(exc))
+            return
+        msg = f"\u2705 {kind.title()} {ref.strip().upper()} posted."
+        msg += outside_view_note(tx_date, dept) + month_note(tx_date)
+        finish_and_refresh("warning" if warns else "success", msg + ("\n\n\u26a0\ufe0f " + " ".join(warns) if warns else ""))
+
+
+def month_note(tx_date) -> str:
+    t = S.today_local()
+    if (tx_date.year, tx_date.month) == (t.year, t.month):
+        return ""
+    return (f" \u26a0\ufe0f It is dated {tx_date:%B %Y}, not the current month. If that is a mistake, "
+            "use 'Correct a posted entry' to fix it.")
+
+
+def outside_view_note(tx_date, dept) -> str:
+    notes = []
+    if not (start <= tx_date <= end):
+        notes.append("its date is outside the reporting period in the sidebar")
+    if dept_filter and dept != dept_filter:
+        notes.append(f"it belongs to '{dept}', not the department you are viewing")
+    return (" Note: " + " and ".join(notes) + ", so change the sidebar filters to see it.") if notes else ""
+
+
+def transfer_form():
+    v = form_version()
+    st.caption("Use this to move money between your own bank/cash accounts \u2014 e.g. bank to bank, "
+               "a cash withdrawal (bank \u2192 petty cash) or a deposit (petty cash \u2192 bank).")
+    with st.form(f"form_TR_{v}"):
+        a, b, c = st.columns([1.2, 1.2, 2])
+        tx_date = a.date_input("Date", value=S.today_local(), key=f"td_{v}")
+        ref = b.text_input("Voucher no.", value=S.next_ref(db, "TR-"), max_chars=30, key=f"tr_{v}")
+        dept = c.selectbox("Project / department", all_depts, index=default_dept, key=f"tp_{v}")
+        x, y, z = st.columns([2, 2, 1.5])
+        src = x.selectbox("From account (money leaves)", list(cash_active), index=None,
+                          placeholder="Choose\u2026", key=f"tf_{v}")
+        dst = y.selectbox("To account (money arrives)", list(cash_active), index=None,
+                          placeholder="Choose\u2026", key=f"tt_{v}")
+        amt = z.number_input(f"Amount ({CUR})", min_value=0.0, step=100.0, format="%.2f", key=f"ta_{v}")
+        narration = st.text_input("Narration / particulars", max_chars=300, key=f"tn_{v}")
+        go = st.form_submit_button("Post Transfer", type="primary")
+    if go:
+        try:
+            S.post_transfer(db, tx_date=tx_date, ref_no=ref, from_acc=cash_active.get(src),
+                            to_acc=cash_active.get(dst), amount_k=to_kobo(amt), unit_tag=dept,
+                            narration=narration, user=USER)
+        except LedgerError as exc:
+            st.error(str(exc))
+            return
+        finish_and_refresh("success", f"\u2705 Transfer {ref.strip().upper()} posted."
+                           + outside_view_note(tx_date, dept) + month_note(tx_date))
+
+
+# ============================================ correcting a posted voucher
+def start_correction(where: str, vid: int):
+    st.session_state["correcting"] = (where, int(vid))
+    st.rerun()
+
+
+def correction_panel(where: str):
+    """A box that opens at the top of the tab: change what is wrong, save, done."""
+    state = st.session_state.get("correcting")
+    if not (state and state[0] == where):
+        return
+    vid = state[1]
+    orig = S.get_voucher(db, vid)
+    with st.container(border=True):
+        if orig is None or orig["status"] != "ACTIVE" or orig["v_type"] == "REVERSAL":
+            st.error("This voucher can no longer be corrected (it was already reversed or corrected).")
+            if st.button("Close", key=f"cclose_{vid}"):
+                st.session_state.pop("correcting", None)
+                st.rerun()
+            return
+        st.markdown(f"### \u270f\ufe0f Correct voucher {orig['ref_no']}")
+        st.caption("Change what is wrong and save. The app cancels the old voucher (a reversal dated on the "
+                   "old voucher's own date) and posts your corrected one, in one step. Both stay on record "
+                   "and nothing is deleted. Debits must equal credits.")
+        used = {x["acc_code"] for x in orig["lines"]}
+        choices = options_for(accounts[(accounts["is_active"] == 1) | accounts["code"].isin(used)], LABEL_STYLE)
+        label_of = {code: label for label, code in choices.items()}
+        depts = all_depts if orig["unit_tag"] in all_depts else all_depts + [orig["unit_tag"]]
+        n = st.number_input("Number of lines", 2, 20, max(2, len(orig["lines"])), key=f"cn_{vid}")
+        with st.form(f"cform_{vid}"):
+            a, b, c = st.columns([1.2, 1.2, 2.5])
+            new_date = a.date_input("Date", value=orig["tx_date"], key=f"cd_{vid}")
+            new_ref = b.text_input("New voucher no.", value=S.suggest_correction_ref(db, orig["ref_no"]),
+                                   max_chars=30, key=f"cr_{vid}")
+            dept = c.selectbox("Project / department", depts, index=depts.index(orig["unit_tag"]),
+                               key=f"cp_{vid}")
+            narration = st.text_input("Narration / particulars", value=orig["narration"], max_chars=300,
+                                      key=f"cnar_{vid}")
+            rows = []
+            for i in range(int(n)):
+                old = orig["lines"][i] if i < len(orig["lines"]) else None
+                w, x, y, z = st.columns([4, 3, 1.6, 1.6])
+                idx = list(choices).index(label_of[old["acc_code"]]) if old and old["acc_code"] in label_of else None
+                acc = w.selectbox(f"Account {i + 1}", list(choices), index=idx, placeholder="Type to search\u2026",
+                                  key=f"ca_{vid}_{i}")
+                note = x.text_input(f"Line note {i + 1}", value=old["note"] if old else "", max_chars=200,
+                                    key=f"cl_{vid}_{i}")
+                dr = y.number_input(f"Debit {i + 1}", min_value=0.0, value=(old["debit_k"] / 100) if old else 0.0,
+                                    step=100.0, format="%.2f", key=f"cdr_{vid}_{i}")
+                cr = z.number_input(f"Credit {i + 1}", min_value=0.0, value=(old["credit_k"] / 100) if old else 0.0,
+                                    step=100.0, format="%.2f", key=f"ccr_{vid}_{i}")
+                rows.append((acc, note, dr, cr))
+            reason = st.text_input("Reason for the correction (required)", max_chars=200, key=f"cre_{vid}",
+                                   placeholder="e.g. Wrong month typed")
+            go = st.form_submit_button("Save correction", type="primary")
+        cancel = st.button("Cancel", key=f"ccan_{vid}")
+    if cancel:
+        st.session_state.pop("correcting", None)
+        st.rerun()
+    if go:
+        try:
+            if any((dr or cr) and not acc for acc, _, dr, cr in rows):
+                raise LedgerError("Please choose an account for every line that has an amount.")
+            S.correct_voucher(
+                db, vid, tx_date=new_date, ref_no=new_ref, unit_tag=dept, narration=narration,
+                reason=reason, user=USER,
+                lines=[{"acc_code": choices[acc], "note": note, "debit_k": to_kobo(dr), "credit_k": to_kobo(cr)}
+                       for acc, note, dr, cr in rows if acc])
+        except LedgerError as exc:
+            st.error(str(exc))
+            return
+        st.session_state.pop("correcting", None)
+        finish_and_refresh("success", f"\u2705 {orig['ref_no']} corrected. The new voucher is "
+                           f"{new_ref.strip().upper()}." + outside_view_note(new_date, dept) + month_note(new_date))
+
+
+def correct_picker(where: str):
+    """Pick any recent voucher and open the correction box for it."""
+    if not CAN_REVERSE:
+        return
+    summ = reports.voucher_summary(lines, start, end)
+    summ = summ[(summ["Status"] == "ACTIVE") & (summ["Type"] != "REVERSAL")].head(60)
+    if summ.empty:
+        return
+    st.markdown("#### Made a mistake? Correct a posted entry")
+    st.caption("Wrong month, wrong amount or wrong account? Pick the voucher, fix it and save. "
+               "Nothing is deleted; the old entry is cancelled and the corrected one is posted.")
+    opts = {f"{r.Voucher} | {r.Date} | {r.Type} | {fmt(round(r.Amount * 100))} | {str(r.Narration)[:35]}":
+            int(r.voucher_id) for r in summ.itertuples()}
+    c1, c2 = st.columns([4, 1])
+    pick = c1.selectbox("Voucher to correct", list(opts), index=None, placeholder="Choose a voucher\u2026",
+                        key=f"cpick_{where}")
+    if c2.button("\u270f\ufe0f Correct", key=f"cbtn_{where}", disabled=pick is None):
+        start_correction(where, opts[pick])
+
+
+def tab_cashbook():
+    correction_panel("cashbook")
+    st.subheader("Record cash / bank transaction")
+    if not CAN_POST:
+        st.info("Your login is read-only, so entry forms are hidden.")
+    elif not cash_active:
+        st.warning("There is no active bank/cash account. An admin must add one in the Chart of Accounts tab.")
+    else:
+        kind = st.radio("What are you recording?",
+                        ["Receipt (money in)", "Payment (money out)", "Transfer between bank/cash accounts"],
+                        horizontal=True, key="cb_kind")
+        if kind.startswith("Transfer"):
+            transfer_form()
+        else:
+            voucher_form("RECEIPT" if kind.startswith("Receipt") else "PAYMENT")
+    st.divider()
+    st.subheader("Cashbook register")
+    pick = st.selectbox("Show", ["All bank & cash accounts"] + list(cash_all), key="reg_acc")
+    code = cash_all.get(pick)
+    reg, opening, closing = reports.cash_register(lines, start, end, code)
+    if len(reg) == 1:
+        st.info("No cashbook transactions in this period yet. Use the form above to record the first one.")
+    show_table(reg, ["Receipt (In)", "Payment (Out)", "Balance"])
+    st.caption(f"Opening balance {fmt(opening)} \u2192 closing balance {fmt(closing)}")
+    download_excel("\u2b07\ufe0f Download cashbook (Excel)", {"Cashbook": reg},
+                   f"cashbook_{start}_{end}.xlsx", "dl_cashbook")
+    st.divider()
+    correct_picker("cashbook")
+
+
+# ============================================================ 2. journal
+def tab_journal():
+    if not CAN_POST:
+        st.info("Your login is read-only, so entry forms are hidden.")
+        return
+    st.subheader("Journal & opening balances")
+    mode = st.radio("What are you recording?",
+                    ["Journal (non-cash adjustment: depreciation, accruals, corrections)",
+                     "Opening balances (balances brought forward when you start using the app)"],
+                    key="jv_mode")
+    opening = mode.startswith("Opening")
+    if opening:
+        st.caption("Enter each account's balance on the day before you start. Debits must equal "
+                   "credits \u2014 put the difference in an equity account such as Retained Earnings. "
+                   "Bank/cash accounts are allowed here.")
+        choices = options_for(active, LABEL_STYLE)
+    else:
+        st.caption("For entries that do not move money in or out of the bank (so bank/cash accounts "
+                   "are not offered here). Debits must equal credits.")
+        choices = head_active
+    v = form_version()
+    n = st.number_input("Number of lines", 2, 20, 2, key=f"jn_{v}_{opening}")
+    with st.form(f"jform_{v}_{opening}"):
+        a, b, c = st.columns([1.2, 1.2, 2.5])
+        d_default = (start - timedelta(days=1)) if opening else S.today_local()
+        tx_date = a.date_input("Date", value=d_default, key=f"jd_{v}_{opening}")
+        ref = b.text_input("Voucher no.", value=S.next_ref(db, "OB-" if opening else "JV-"),
+                           max_chars=30, key=f"jr_{v}_{opening}")
+        dept = c.selectbox("Project / department", all_depts, index=default_dept, key=f"jp_{v}_{opening}")
+        narration = st.text_input("Narration / particulars", max_chars=300, key=f"jnar_{v}_{opening}")
+        rows = []
+        for i in range(int(n)):
+            w, x, y, z = st.columns([4, 3, 1.6, 1.6])
+            acc = w.selectbox(f"Account {i + 1}", list(choices), index=None,
+                              placeholder="Type to search\u2026", key=f"ja_{v}_{opening}_{i}")
+            note = x.text_input(f"Line note {i + 1} (optional)", max_chars=200, key=f"jl_{v}_{opening}_{i}")
+            dr = y.number_input(f"Debit {i + 1}", min_value=0.0, step=100.0, format="%.2f", key=f"jdr_{v}_{opening}_{i}")
+            cr = z.number_input(f"Credit {i + 1}", min_value=0.0, step=100.0, format="%.2f", key=f"jcr_{v}_{opening}_{i}")
+            rows.append((acc, note, dr, cr))
+        go = st.form_submit_button("Post opening balances" if opening else "Post journal", type="primary")
+    if go:
+        try:
+            if any((dr or cr) and not acc for acc, _, dr, cr in rows):
+                raise LedgerError("Please choose an account for every line that has an amount.")
+            S.post_journal(db, tx_date=tx_date, ref_no=ref, unit_tag=dept, narration=narration,
+                           user=USER, opening=opening,
+                           lines=[{"acc_code": choices[acc], "note": note, "debit_k": to_kobo(dr),
+                                   "credit_k": to_kobo(cr)} for acc, note, dr, cr in rows if acc])
+        except LedgerError as exc:
+            st.error(str(exc))
+            return
+        finish_and_refresh("success", f"\u2705 {'Opening balances' if opening else 'Journal'} "
+                           f"{ref.strip().upper()} posted." + outside_view_note(tx_date, dept) + month_note(tx_date))
+
+
+# ============================================================ 3. ledger
+def tab_ledger():
+    st.subheader("General ledger")
+    present = accounts[accounts["code"].isin(lines["acc_code"].unique())]
+    pick = st.selectbox("Account", ["All accounts with activity"] + list(options_for(present)),
+                        key="gl_pick")
+    code = options_for(present).get(pick)
+    ledgers = reports.all_ledgers(lines, start, end, code)
+    if not ledgers:
+        st.info("No ledger activity for this period yet.")
+        return
+    combined = pd.concat([led["df"].assign(Account=f"{led['code']} - {led['name']}") for led in ledgers],
+                         ignore_index=True)
+    combined = combined[["Account"] + [c for c in combined.columns if c != "Account"]]
+    download_excel("\u2b07\ufe0f Download ledger (Excel)", {"General Ledger": combined},
+                   f"general_ledger_{start}_{end}.xlsx", "dl_gl")
+    shown = ledgers if code else ledgers[:60]
+    if len(ledgers) > len(shown):
+        st.caption(f"Showing the first {len(shown)} of {len(ledgers)} accounts \u2014 pick one account "
+                   "above, or download the Excel file, to see the rest.")
+    for led in shown:
+        title = (f"{led['code']} - {led['name']}  ({led['acc_type']})   |   b/f {fmt(led['opening_k'])}  "
+                 f"\u2192  c/f {fmt(led['closing_k'])}   |   {led['n']} entries")
+        with st.expander(title, expanded=bool(code)):
+            show_table(led["df"], ["Debit", "Credit", "Balance"])
+
+
+# ============================================================ 4. trial balance
+def tab_trial_balance():
+    st.subheader(f"Trial balance as at {end}")
+    hide = st.checkbox("Hide accounts with a zero balance", True, key="tb_hide")
+    tb, dr, cr = reports.trial_balance(lines, end, hide)
+    if tb.empty:
+        st.info("Nothing posted yet, so the trial balance is empty.")
+        return
+    show_table(tb, ["Debit", "Credit"])
+    if dr == cr:
+        st.success(f"Trial balance agrees: total debits = total credits = {fmt(dr)}")
+    else:
+        st.error(f"Trial balance does NOT agree. Debits {fmt(dr)} vs credits {fmt(cr)}. "
+                 "Please contact the administrator.")
+    download_excel("\u2b07\ufe0f Download trial balance (Excel)", {"Trial Balance": tb},
+                   f"trial_balance_{end}.xlsx", "dl_tb")
+
+
+# ============================================================ 5. vouchers
+def tab_vouchers():
+    correction_panel("vouchers")
+    st.subheader("Vouchers & reversals")
+    st.caption("A posted voucher is never edited or deleted. To fix a mistake use 'Correct this voucher' "
+               "(it cancels the old entry and posts the corrected one in one step), or reverse it to cancel it.")
+    summ = reports.voucher_summary(lines, start, end)
+    if summ.empty:
+        st.info("No vouchers in this period.")
+        return
+    show_table(summ.drop(columns="voucher_id"), ["Amount"], height=300)
+    options = {f"{r.Voucher} | {r.Date} | {r.Type} | {fmt(round(r.Amount * 100))} | {r.Status}": int(r.voucher_id)
+               for r in summ.itertuples()}
+    pick = st.selectbox("Open a voucher to see its lines or reverse it", list(options), index=None,
+                        placeholder="Choose a voucher\u2026", key="vp")
+    if not pick:
+        return
+    vid = options[pick]
+    row = summ[summ["voucher_id"] == vid].iloc[0]
+    st.markdown(f"**{row['Voucher']}** \u2014 {row['Narration']}  \n"
+                f"{row['Date']} \u00b7 {row['Type']} \u00b7 {row['Department']} \u00b7 "
+                f"posted by {row['Posted by']} \u00b7 status **{row['Status']}**")
+    show_table(reports.voucher_detail(lines, vid), ["Debit", "Credit"])
+    if not CAN_REVERSE:
+        st.info("Your login cannot reverse vouchers.")
+    elif row["Type"] == "REVERSAL":
+        st.info("This is a reversal entry and cannot itself be reversed.")
+    elif row["Status"] != "ACTIVE":
+        st.info("This voucher has already been reversed.")
+    else:
+        if st.button("\u270f\ufe0f Correct this voucher (fix the date, amount or account)", key=f"vcor_{vid}"):
+            start_correction("vouchers", vid)
+        with st.form(f"rev_{vid}"):
+            st.markdown("**Or just cancel it (reverse) without a replacement**")
+            a, b = st.columns([1, 3])
+            rdate = a.date_input("Reversal date", value=max(S.today_local(), pd.Timestamp(row["Date"]).date()))
+            reason = b.text_input("Reason (required)", max_chars=200)
+            sure = st.checkbox("I understand this posts an opposite entry and cannot be undone")
+            go = st.form_submit_button("Reverse voucher", type="primary")
+        if go:
+            if not sure:
+                st.error("Please tick the box to confirm.")
+            else:
+                try:
+                    S.reverse_voucher(db, vid, rdate, reason, USER)
+                except LedgerError as exc:
+                    st.error(str(exc))
                 else:
-                    raw_coa = pd.read_excel(uploaded_file)
+                    finish_and_refresh("success", f"\u2705 {row['Voucher']} reversed.")
 
-                parsed_rows = smart_parse_coa_df(raw_coa)
-                st.write(f"**Detected {len(parsed_rows)} valid accounts in `{uploaded_file.name}`:**")
-                if parsed_rows:
-                    preview_df = pd.DataFrame(parsed_rows, columns=["Account Code", "Account Name", "Category", "Is Bank/Cash"])
-                    st.dataframe(preview_df, use_container_width=True, hide_index=True)
 
-                    if st.button("✅ Confirm & Save Uploaded Chart of Accounts"):
-                        conn = get_conn()
-                        cur = conn.cursor()
-                        cur.execute("DELETE FROM accounts")
-                        for code_v, name_v, type_v, cash_v in parsed_rows:
-                            cur.execute(f"DELETE FROM accounts WHERE code = {PH}", (code_v,))
-                            cur.execute(
-                                f"INSERT INTO accounts VALUES ({PH}, {PH}, {PH}, {PH})",
-                                (code_v, name_v, type_v, cash_v)
-                            )
-                        conn.commit()
-                        cur.close()
-                        conn.close()
-                        st.success(f"Successfully imported {len(parsed_rows)} accounts!")
-                        st.rerun()
-            except Exception as e:
-                st.error(f"Could not read file: {e}")
+# ============================================================ 6. chart of accounts
+def tab_coa():
+    st.subheader(f"Chart of accounts \u2014 {len(accounts)} accounts ({len(active)} active)")
+    view = pd.DataFrame({"Code": accounts["code"], "Name": accounts["name"], "Type": accounts["acc_type"],
+                         "Bank/Cash": accounts["is_cash"].map({1: "Yes", 0: ""}),
+                         "Status": accounts["is_active"].map({1: "Active", 0: "Hidden"})})
+    show_table(view, height=320)
+    download_excel("\u2b07\ufe0f Download chart of accounts (Excel)", {"Chart of Accounts": view},
+                   "chart_of_accounts.xlsx", "dl_coa")
+    if not IS_ADMIN:
+        st.info("Only an admin can change the chart of accounts.")
+        return
 
-    with col_manual:
-        st.markdown("#### ➕ Add a Single Account Manually")
-        with st.form("add_single_coa", clear_on_submit=True):
-            new_code = st.text_input("Account Code", placeholder="e.g. 14004")
-            new_name = st.text_input("Account Name", placeholder="e.g. UBA BANK")
-            new_type = st.selectbox("Account Type", ["Asset", "Liability", "Equity", "Revenue", "Expense"])
-            is_cash_acc = st.checkbox("Check if this is a Bank or Cash Account")
-            if st.form_submit_button("+ Save Account"):
-                if new_code.strip() and new_name.strip():
-                    conn = get_conn()
-                    cur = conn.cursor()
-                    cur.execute(f"DELETE FROM accounts WHERE code = {PH}", (new_code.strip(),))
-                    cur.execute(
-                        f"INSERT INTO accounts VALUES ({PH}, {PH}, {PH}, {PH})",
-                        (new_code.strip(), new_name.strip(), new_type, 1 if is_cash_acc else 0)
-                    )
-                    conn.commit()
-                    cur.close()
-                    conn.close()
-                    st.success(f"Added {new_code} - {new_name}!")
-                    st.rerun()
+    st.divider()
+    st.markdown("#### Add or edit one account")
+    st.caption("If the code already exists its name is updated. Type and bank/cash setting can only be "
+               "changed while no entries use the account.")
+    with st.form("coa_one"):
+        a, b, c, d = st.columns([1, 3, 1.5, 1])
+        code = a.text_input("Code")
+        name = b.text_input("Account name")
+        acc_type = c.selectbox("Type", ACCOUNT_TYPES)
+        is_cash = d.checkbox("Bank / cash")
+        go = st.form_submit_button("Save account")
+    if go:
+        try:
+            res = S.upsert_accounts(db, [(code, name, acc_type, int(is_cash))], USER)
+        except LedgerError as exc:
+            st.error(str(exc))
+        else:
+            note = " (its type/cash setting was kept because entries already use it)" if res["locked"] else ""
+            finish_and_refresh("success", f"\u2705 Account {code.strip()} saved{note}.")
 
-    st.markdown("---")
-    st.markdown(f"#### 📋 Current Active Chart of Accounts ({len(acc_df)} Accounts)")
-    st.dataframe(acc_df, use_container_width=True, hide_index=True)
+    st.markdown("#### Hide or show an account")
+    st.caption("Accounts are never deleted. A hidden account disappears from the entry forms but stays "
+               "in all reports. It needs a zero balance first.")
+    labels = options_for(accounts)
+    pick = st.selectbox("Account", list(labels), index=None, placeholder="Choose\u2026", key="coa_hide")
+    if pick:
+        cur_active = int(accounts.loc[accounts["code"] == labels[pick], "is_active"].iloc[0])
+        if st.button("Hide this account" if cur_active else "Show this account again"):
+            try:
+                S.set_account_active(db, labels[pick], not cur_active, USER)
+            except LedgerError as exc:
+                st.error(str(exc))
+            else:
+                finish_and_refresh("success", "\u2705 Done.")
+
+    st.markdown("#### Upload a chart of accounts (Excel or CSV)")
+    st.caption("This is a safe merge: new accounts are added and existing ones are updated. "
+               "Nothing is ever deleted. You can correct the preview before saving.")
+    up = st.file_uploader("Choose a file", type=["xlsx", "xls", "csv"], key="coa_up")
+    if up is not None:
+        try:
+            preview = coa_import.parse_coa(coa_import.read_table(up))
+        except Exception as exc:
+            st.error(f"Could not read that file: {exc}")
+            preview = pd.DataFrame()
+        if preview.empty:
+            st.warning("No accounts were found. Each row needs a numeric code (3-12 digits) and a name.")
+        else:
+            st.caption(f"{len(preview)} accounts found. Fix any wrong Type or Bank/Cash tick below.")
+            edited = st.data_editor(
+                preview, hide_index=True, disabled=["Code"], key=f"coa_prev_{up.name}",
+                column_config={"Type": st.column_config.SelectboxColumn("Type", options=ACCOUNT_TYPES, required=True),
+                               "Cash": st.column_config.CheckboxColumn("Bank / cash")})
+            if st.button("Add / update these accounts", type="primary"):
+                try:
+                    res = S.upsert_accounts(db, [(r.Code, r.Name, r.Type, int(r.Cash)) for r in edited.itertuples()], USER)
+                except LedgerError as exc:
+                    st.error(str(exc))
+                else:
+                    finish_and_refresh("success", f"\u2705 {res['added']} added, {res['updated']} updated, "
+                                       f"{res['unchanged']} unchanged"
+                                       + (f", type kept for {len(res['locked'])} in use" if res["locked"] else "") + ".")
+
+    missing = [r for r in DEFAULT_COA if r[0] not in set(accounts["code"])]
+    if missing and st.button(f"Add the {len(missing)} missing KONEK default accounts"):
+        S.upsert_accounts(db, missing, USER)
+        finish_and_refresh("success", f"\u2705 {len(missing)} default accounts added.")
+
+    st.markdown("#### Projects / departments")
+    st.write(", ".join(all_depts))
+    with st.form("dept_add"):
+        new_dept = st.text_input("New project / department name", max_chars=80)
+        if st.form_submit_button("Add department"):
+            try:
+                S.add_department(db, new_dept, USER)
+            except LedgerError as exc:
+                st.error(str(exc))
+            else:
+                finish_and_refresh("success", f"\u2705 Department '{new_dept.strip()}' added.")
+
+
+# ============================================================ 7. audit
+def tab_audit():
+    st.subheader("Audit log (latest 500 actions)")
+    show_table(S.audit_df(db), height=500)
+
+
+names = ["1. Cashbook", "2. Journal & Opening Balances", "3. General Ledger", "4. Trial Balance",
+         "5. Vouchers & Reversals", "6. Chart of Accounts"] + (["7. Audit Log"] if auth.can(user, "audit") else [])
+tabs = st.tabs(names)
+for tab, fn in zip(tabs, [tab_cashbook, tab_journal, tab_ledger, tab_trial_balance, tab_vouchers,
+                          tab_coa, tab_audit]):
+    with tab:
+        fn()
